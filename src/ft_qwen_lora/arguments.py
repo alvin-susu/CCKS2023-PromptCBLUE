@@ -264,12 +264,12 @@ class DataTrainingArguments:
                 # 获取文件名后缀
                 extension = self.train_file.split(".")[-1]
                 # 检查后缀是否为csv或者json文件
-                assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+                assert extension in ["csv", "json", "jsonl"], "`train_file` should be a csv or a json file."
                 # 如果验证集不为空
             if self.validation_file is not None:
                 # 获取文件名后缀
                 extension = self.validation_file.split(".")[-1]
                 # 检查后缀是否为csv或者json文件
-                assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+                assert extension in ["csv", "json", "jsonl"], "`validation_file` should be a csv or a json file."
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length

@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import sys
+sys.path.append("../../../CCKS2023-PromptCBLUE")
+
 from functools import partial
 
 import jieba
@@ -11,7 +13,8 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 from rouge_chinese import Rouge
 
-sys.path.append("../../../CCKS2023-PromptCBLUE")
+from src.utils.mock import create_mock_trainer
+
 
 from datasets import load_dataset
 from src.ft_qwen_lora.arguments import ModelArguments, DataTrainingArguments
@@ -428,24 +431,31 @@ def eval(training_args, data_args, eval_dataset, trainer):
 def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
     logger.info("*** Predict ***")
 
-    # 读取原test file
+    # 读取原 test file（添加错误处理）
     list_test_samples = []
-    with open(data_args.test_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = json.loads(line)
-            list_test_samples.append(line)
+    try:
+        with open(data_args.test_file, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    logger.warning(f"跳过空行：第 {line_num} 行")
+                    continue
+                try:
+                    data = json.loads(line)
+                    list_test_samples.append(data)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"测试文件第 {line_num} 行,line为:{line} JSON 解析失败: {e}")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"测试文件不存在: {data_args.test_file}")
 
+    # 执行预测
     predict_results = trainer.predict(
         predict_dataset,
         metric_key_prefix="predict",
-        # max_tokens=512,
         max_new_tokens=data_args.max_target_length,
         do_sample=False,
         num_beams=1,
         use_cache=True,
-        # top_p=0.7,
-        # temperature=0.95,
-        # repetition_penalty=1.1
     )
     metrics = predict_results.metrics
     print(metrics)
@@ -471,15 +481,18 @@ def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
 
             output_prediction_file = os.path.join(training_args.output_dir, "test_predictions.json")
 
+            # 写入预测结果（添加序列化检查）
             with open(output_prediction_file, "w", encoding="utf-8") as writer:
                 for idx, (p, l) in enumerate(zip(predictions, labels)):
+                    if idx >= len(list_test_samples):
+                        raise IndexError("预测结果数量超过测试样本数")
                     samp = list_test_samples[idx]
                     samp["target"] = p
-                    res = json.dumps(samp, ensure_ascii=False)
-                    writer.write(f"{res}\n")
-
-    return results
-
+                    try:
+                        res = json.dumps(samp, ensure_ascii=False)
+                        writer.write(f"{res}\n")
+                    except TypeError as e:
+                        raise ValueError(f"无法序列化第 {idx} 个样本: {str(e)}")
 
 def main():
     # HFArgumentParser 主要处理命令行的参数 ModelArguments为模型相关参数 DataTrainingArguments为数据训练相关参数
@@ -559,7 +572,7 @@ def main():
         pad_to_multiple_of=None,
         padding=False
     )
-    sample_batch = data_collator([train_dataset[0]])
+    sample_batch = data_collator([eval_dataset[0]])
     logger.info(f"sample_batch keys is {sample_batch.keys()}")
 
     # 初始化训练器
@@ -575,8 +588,10 @@ def main():
         compute_metrics=compute_metrics_func if training_args.predict_with_generate else None
     )
 
-    # 开始训练
-    trainer = train(training_args, data_args, trainer, train_dataset, model)
+    # 模型训练
+    # trainer = train(training_args, data_args, trainer, train_dataset, model)
+
+    trainer = create_mock_trainer()
 
     # 模型评估
     eval(training_args, data_args, eval_dataset, trainer)
