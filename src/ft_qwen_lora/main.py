@@ -1,5 +1,5 @@
+import json
 import logging
-
 import os
 import sys
 from functools import partial
@@ -17,8 +17,6 @@ from datasets import load_dataset
 from src.ft_qwen_lora.arguments import ModelArguments, DataTrainingArguments
 
 from transformers import (
-    AutoConfig,
-    AutoModel,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     HfArgumentParser,
@@ -128,11 +126,6 @@ def preprocess_function_train(examples, data_args: DataTrainingArguments, tokeni
 
     logger.info(f"前两个examples[prompt_column] 为 {examples[prompt_column][0:2]}")
 
-    # len(examples[prompt_column]) = 训练数据长度
-    logger.info(f"bos_token: {tokenizer.bos_token} | bos_token_id: {tokenizer.bos_token_id}")
-    logger.info(f"eos_token: {tokenizer.eos_token} | eos_token_id: {tokenizer.eos_token_id}")
-    logger.info(f"pad_token: {tokenizer.pad_token} | pad_token_id: {tokenizer.pad_token_id}")
-
     for i in range(len(examples[prompt_column])):
         # 一组数据的input 和 labels 都不为空
         if examples[prompt_column][i] and examples[response_column][i]:
@@ -188,6 +181,7 @@ def preprocess_function_train(examples, data_args: DataTrainingArguments, tokeni
         "labels": torch.LongTensor(labels),
     }
 
+
 def preprocess_function_eval(examples, tokenizer, data_args):
     prompt_column = data_args.prompt_column
     response_column = data_args.response_column
@@ -228,6 +222,7 @@ def preprocess_function_eval(examples, tokenizer, data_args):
     model_inputs["labels"] = labels["input_ids"]
 
     return model_inputs
+
 
 def print_dataset_example(example, tokenizer):
     print("input_ids: ", example["input_ids"])
@@ -409,12 +404,81 @@ def train(training_args, data_args, trainer, train_dataset, model):
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
         metrics = train_result.metrics
-        max_train_samples = data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+        max_train_samples = data_args.max_train_samples if data_args.max_train_samples is not None else len(
+            train_dataset)
 
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
+        return trainer
+
+
+def eval(training_args, data_args, eval_dataset, trainer):
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+        metrics = trainer.evaluate(metric_key_prefix="eval", do_sample=True, top_p=0.7, max_length=512,
+                                   temperature=0.95)
+        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+
+
+def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
+    logger.info("*** Predict ***")
+
+    # 读取原test file
+    list_test_samples = []
+    with open(data_args.test_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = json.loads(line)
+            list_test_samples.append(line)
+
+    predict_results = trainer.predict(
+        predict_dataset,
+        metric_key_prefix="predict",
+        # max_tokens=512,
+        max_new_tokens=data_args.max_target_length,
+        do_sample=False,
+        num_beams=1,
+        use_cache=True,
+        # top_p=0.7,
+        # temperature=0.95,
+        # repetition_penalty=1.1
+    )
+    metrics = predict_results.metrics
+    print(metrics)
+    max_predict_samples = (
+        data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
+    )
+    metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
+
+    trainer.log_metrics("predict", metrics)
+    trainer.save_metrics("predict", metrics)
+
+    if trainer.is_world_process_zero():
+        if training_args.predict_with_generate:
+            predictions = tokenizer.batch_decode(
+                predict_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
+            predictions = [pred.strip() for pred in predictions]
+            labels = tokenizer.batch_decode(
+                predict_results.label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
+            labels = [label.strip() for label in labels]
+            assert len(labels) == len(list_test_samples)
+
+            output_prediction_file = os.path.join(training_args.output_dir, "test_predictions.json")
+
+            with open(output_prediction_file, "w", encoding="utf-8") as writer:
+                for idx, (p, l) in enumerate(zip(predictions, labels)):
+                    samp = list_test_samples[idx]
+                    samp["target"] = p
+                    res = json.dumps(samp, ensure_ascii=False)
+                    writer.write(f"{res}\n")
+
+    return results
 
 
 def main():
@@ -478,9 +542,6 @@ def main():
     # 打印训练参数比
     model.print_trainable_parameters()
 
-    # 预处理数据 生成模型输入
-    inputs = process_raw_data(data_args, training_args, raw_datasets, model, tokenizer)
-
     # 训练&验证&测试 预处理数据
     train_dataset, eval_dataset, predict_dataset = None, None, None
     if training_args.do_train:
@@ -515,8 +576,15 @@ def main():
     )
 
     # 开始训练
-    train(training_args, data_args, trainer, train_dataset, model)
+    trainer = train(training_args, data_args, trainer, train_dataset, model)
 
+    # 模型评估
+    eval(training_args, data_args, eval_dataset, trainer)
+
+    # 模型预测
+    results = predict(training_args, data_args, eval_dataset, tokenizer, trainer)
+
+    logger.info(f"results is {results}")
 
 if __name__ == "__main__":
     main()
