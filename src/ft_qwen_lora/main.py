@@ -2,17 +2,20 @@ import logging
 
 import os
 import sys
+from functools import partial
 
+import jieba
+import numpy as np
 import torch
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
+from rouge_chinese import Rouge
 
 sys.path.append("../../../CCKS2023-PromptCBLUE")
 
-from src.ft_qwen_lora.configuration_qwen import QwenConfig
 from datasets import load_dataset
 from src.ft_qwen_lora.arguments import ModelArguments, DataTrainingArguments
 
-import transformers
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -21,7 +24,7 @@ from transformers import (
     HfArgumentParser,
     Seq2SeqTrainingArguments,
     set_seed,
-    logging as hf_logging, Qwen2Config,
+    logging as hf_logging, Qwen2Config, Seq2SeqTrainer, AutoModelForCausalLM,
 )
 
 # 创建一个日志记录器，名称为当前模块的名称
@@ -64,7 +67,7 @@ def load_qwen_model_and_tokenizer(model_args: ModelArguments):
     logger.info(f"加载分词器 tokenizer is{tokenizer}")
 
     # 半精度加载模型
-    model = AutoModel.from_pretrained(model_args.model_name_or_path, config=config).half().cuda()
+    model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, config=config).half().cuda()
     logger.info(f"半精度加载模型 model is{model}")
     return model, tokenizer
 
@@ -185,6 +188,46 @@ def preprocess_function_train(examples, data_args: DataTrainingArguments, tokeni
         "labels": torch.LongTensor(labels),
     }
 
+def preprocess_function_eval(examples, tokenizer, data_args):
+    prompt_column = data_args.prompt_column
+    response_column = data_args.response_column
+    history_column = data_args.history_column
+    max_target_length = data_args.max_target_length
+    prefix = data_args.source_prefix if data_args.source_prefix is not None else ""
+
+    inputs, targets = [], []
+    for i in range(len(examples[prompt_column])):
+        if not examples[response_column][i]:
+            targets.append("filled in !")
+        else:
+            targets.append(examples[response_column][i])
+
+        if examples[prompt_column][i]:
+            query = examples[prompt_column][i]
+            if history_column is None or len(examples[history_column][i]) == 0:
+                prompt = query
+            else:
+                prompt = ""
+                history = examples[history_column][i]
+                for turn_idx, (old_query, response) in enumerate(history):
+                    prompt += "[Round {}]\n问：{}\n答：{}\n".format(turn_idx, old_query, response)
+                prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
+            inputs.append(prompt)
+
+    inputs = [prefix + inp for inp in inputs]
+    model_inputs = tokenizer(inputs,
+                             max_length=data_args.max_source_length,
+                             truncation=True,
+                             padding=True)
+    labels = tokenizer(text_target=targets, max_length=max_target_length, truncation=True)
+
+    if data_args.ignore_pad_token_for_loss:
+        labels["input_ids"] = [
+            [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
+        ]
+    model_inputs["labels"] = labels["input_ids"]
+
+    return model_inputs
 
 def print_dataset_example(example, tokenizer):
     print("input_ids: ", example["input_ids"])
@@ -215,7 +258,8 @@ def process_raw_data(data_args: DataTrainingArguments, training_args: Seq2SeqTra
     return inputs
 
 
-def train(raw_datasets, tokenizer, data_args: DataTrainingArguments, training_args: Seq2SeqTrainingArguments):
+def train_dataset_for_model(raw_datasets, tokenizer, data_args: DataTrainingArguments,
+                            training_args: Seq2SeqTrainingArguments):
     if "train" not in raw_datasets:
         raise ValueError("--do_train requires a train dataset")
 
@@ -239,7 +283,7 @@ def train(raw_datasets, tokenizer, data_args: DataTrainingArguments, training_ar
             remove_columns=raw_datasets["train"].column_names,
             load_from_cache_file=False,
             desc="Running tokenizer on train dataset",
-            fn_kwargs={  #传递额外参数
+            fn_kwargs={  # 传递额外参数
                 "data_args": data_args,
                 "tokenizer": tokenizer
             }
@@ -247,12 +291,130 @@ def train(raw_datasets, tokenizer, data_args: DataTrainingArguments, training_ar
     return train_dataset
 
 
-def valid():
-    pass
+def valid_dataset_for_model(raw_datasets, tokenizer, data_args: DataTrainingArguments,
+                            training_args: Seq2SeqTrainingArguments):
+    if "validation" not in raw_datasets:
+        raise ValueError("--do_eval requires a validation dataset")
+
+    # 取出训练数据
+    eval_dataset = raw_datasets["validation"]
+
+    # 最大训练样本数量
+    if data_args.max_eval_samples is not None:
+        max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+        eval_dataset = eval_dataset.select(range(max_eval_samples))
+
+    """
+    让主进程先执行某些操作，比如数据预处理，然后再由其他进程处理。
+    比如在分布式训练中，可能每个进程都会加载数据集，但预处理步骤如果由所有进程各自执行的话，可能会有重复，浪费资源。所以让主进程先处理，然后将结果共享给其他进程，这样可以节省时间和内存
+    """
+    with training_args.main_process_first(desc="validation dataset map pre-processing"):
+        eval_dataset = eval_dataset.map(
+            preprocess_function_eval,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=raw_datasets["train"].column_names,
+            load_from_cache_file=False,
+            desc="Running tokenizer on train dataset",
+            fn_kwargs={
+                "data_args": data_args,
+                "tokenizer": tokenizer
+            }
+        )
+    return eval_dataset
 
 
-def predict():
-    pass
+def predict_dataset_for_model(raw_datasets, tokenizer, data_args: DataTrainingArguments,
+                              training_args: Seq2SeqTrainingArguments):
+    if "test" not in raw_datasets:
+        raise ValueError("--do_eval requires a test dataset")
+
+    # 取出训练数据
+    predict_dataset = raw_datasets["test"]
+
+    # 最大训练样本数量
+    if data_args.max_predict_samples is not None:
+        max_predict_samples = min(len(predict_dataset), data_args.max_predict_samples)
+        predict_dataset = predict_dataset.select(range(max_predict_samples))
+
+    """
+    让主进程先执行某些操作，比如数据预处理，然后再由其他进程处理。
+    比如在分布式训练中，可能每个进程都会加载数据集，但预处理步骤如果由所有进程各自执行的话，可能会有重复，浪费资源。所以让主进程先处理，然后将结果共享给其他进程，这样可以节省时间和内存
+    """
+    with training_args.main_process_first(desc="validation dataset map pre-processing"):
+        predict_dataset = predict_dataset.map(
+            preprocess_function_train,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=raw_datasets["train"].column_names,
+            load_from_cache_file=False,
+            desc="Running tokenizer on train dataset",
+            fn_kwargs={
+                "data_args": data_args,
+                "tokenizer": tokenizer
+            }
+        )
+    return predict_dataset
+
+
+def compute_metrics(eval_predicts, tokenizer, data_args):
+    predicts, labels = eval_predicts
+    if isinstance(predicts, tuple):
+        predicts = predicts[0]
+    decoded_predicts = tokenizer.batch_decode(predicts, skip_special_tokens=True)
+    if data_args.ignore_pad_token_for_loss:
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    score_dict = {
+        "rouge-1": [],
+        "rouge-2": [],
+        "rouge-l": [],
+        "bleu-4": []
+    }
+    for pred, label in zip(decoded_predicts, decoded_labels):
+        hypothesis = list(jieba.cut(pred))
+        reference = list(jieba.cut(label))
+
+        rouge = Rouge()
+        hypothesis = ' '.join(hypothesis)
+        if not hypothesis:
+            hypothesis = "-"
+        scores = rouge.get_scores(hypothesis, ''.join(reference))
+        result = scores[0]
+
+        for k, v in result.items():
+            score_dict[k].append(round(v["f"] * 100, 4))
+
+        # blue_score
+        bleu_score = sentence_bleu([list(label)], list(pred), smoothing_function=SmoothingFunction().method3)
+        score_dict["bleu-4"].append(round(bleu_score * 100, 4))
+
+    for k, v in score_dict.items():
+        score_dict[k] = float(np.mean(v))
+    return score_dict
+
+
+def train(training_args, data_args, trainer, train_dataset, model):
+    if training_args.do_train:
+        checkpoint = None
+        # 模型检查保存点
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+
+        # 开始训练
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+
+        metrics = train_result.metrics
+        max_train_samples = data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+
+        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
 
 
 def main():
@@ -319,18 +481,41 @@ def main():
     # 预处理数据 生成模型输入
     inputs = process_raw_data(data_args, training_args, raw_datasets, model, tokenizer)
 
-    # 开始训练
+    # 训练&验证&测试 预处理数据
+    train_dataset, eval_dataset, predict_dataset = None, None, None
     if training_args.do_train:
-        train_dataset_example = train(raw_datasets, tokenizer, data_args, training_args)
-        logger.info(f"train_dataset_example: {train_dataset_example[0]}")
-        print_dataset_example(train_dataset_example[0], tokenizer)
-        print_dataset_example(train_dataset_example[1], tokenizer)
-
+        train_dataset = train_dataset_for_model(raw_datasets, tokenizer, data_args, training_args)
     if training_args.do_eval:
-        valid()
-
+        eval_dataset = valid_dataset_for_model(raw_datasets, tokenizer, data_args, training_args)
     if training_args.do_predict:
-        predict()
+        predict_dataset = predict_dataset_for_model(raw_datasets, tokenizer, data_args, training_args)
+
+    # 加载数据集 DataCollator
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        label_pad_token_id=-100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
+        pad_to_multiple_of=None,
+        padding=False
+    )
+    sample_batch = data_collator([train_dataset[0]])
+    logger.info(f"sample_batch keys is {sample_batch.keys()}")
+
+    # 初始化训练器
+    training_args.generation_max_length = training_args.generation_max_length if training_args.generation_max_length is not None else data_args.val_max_target_length
+    training_args.generation_num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
+    compute_metrics_func = partial(compute_metrics, tokenizer=tokenizer, data_args=data_args)
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics_func if training_args.predict_with_generate else None
+    )
+
+    # 开始训练
+    train(training_args, data_args, trainer, train_dataset, model)
 
 
 if __name__ == "__main__":
