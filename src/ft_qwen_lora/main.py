@@ -458,7 +458,7 @@ def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
         use_cache=True,
     )
     metrics = predict_results.metrics
-    print(metrics)
+    logger.info(f"最后执行预测的指标为: {metrics}")
     max_predict_samples = (
         data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
     )
@@ -466,8 +466,9 @@ def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
 
     trainer.log_metrics("predict", metrics)
     trainer.save_metrics("predict", metrics)
-
-    if trainer.is_world_process_zero():
+    is_world_process_zero = trainer.is_world_process_zero()
+    logger.info(f"is_world_process_zero is {is_world_process_zero}")
+    if is_world_process_zero:
         if training_args.predict_with_generate:
             predictions = tokenizer.batch_decode(
                 predict_results.predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
@@ -477,9 +478,12 @@ def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
                 predict_results.label_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
             )
             labels = [label.strip() for label in labels]
+            logger.info(f"预测:{predictions}和期望:{labels}")
             assert len(labels) == len(list_test_samples)
 
+            logger.info(f"预测指标输出的文件夹路径为:{training_args.output_dir}")
             output_prediction_file = os.path.join(training_args.output_dir, "test_predictions.json")
+            logger.info(f"预测指标输出的文件路径为:{output_prediction_file}")
 
             # 写入预测结果（添加序列化检查）
             with open(output_prediction_file, "w", encoding="utf-8") as writer:
@@ -564,7 +568,7 @@ def main():
     if training_args.do_predict:
         predict_dataset = predict_dataset_for_model(raw_datasets, tokenizer, data_args, training_args)
 
-    # 加载数据集 DataCollator
+    # 批处理数据集 DataCollator
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
@@ -597,7 +601,7 @@ def main():
     eval(training_args, data_args, eval_dataset, trainer)
 
     # 模型预测
-    results = predict(training_args, data_args, eval_dataset, tokenizer, trainer)
+    results = predict(training_args, data_args, predict_dataset, tokenizer, trainer)
 
     logger.info(f"results is {results}")
 

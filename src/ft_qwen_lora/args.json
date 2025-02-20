@@ -26,5 +26,6 @@
   "learning_rate": 2e-4,
   "trainable": "q_proj,k_proj,v_proj,o_proj",
   "max_train_samples": 100,
-  "debug_mode": true
+  "debug_mode": true,
+  "predict_with_generate": true
 }
