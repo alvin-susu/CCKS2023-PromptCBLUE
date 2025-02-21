@@ -14,8 +14,6 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 from rouge_chinese import Rouge
 
-from src.utils.mock import create_mock_trainer
-
 from datasets import load_dataset
 from src.ft_qwen_lora.arguments import ModelArguments, DataTrainingArguments
 
