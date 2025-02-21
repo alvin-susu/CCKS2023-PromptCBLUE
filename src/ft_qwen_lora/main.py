@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sys
+
 sys.path.append("../../../CCKS2023-PromptCBLUE")
 
 from functools import partial
@@ -14,7 +15,6 @@ from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 from rouge_chinese import Rouge
 
 from src.utils.mock import create_mock_trainer
-
 
 from datasets import load_dataset
 from src.ft_qwen_lora.arguments import ModelArguments, DataTrainingArguments
@@ -215,8 +215,11 @@ def preprocess_function_eval(examples, tokenizer, data_args):
     model_inputs = tokenizer(inputs,
                              max_length=data_args.max_source_length,
                              truncation=True,
-                             padding=True)
-    labels = tokenizer(text_target=targets, max_length=max_target_length, truncation=True)
+                             padding="max_length")
+    labels = tokenizer(targets,
+                       max_length=max_target_length,
+                       truncation=True,
+                       padding="max_length")
 
     if data_args.ignore_pad_token_for_loss:
         labels["input_ids"] = [
@@ -325,26 +328,28 @@ def valid_dataset_for_model(raw_datasets, tokenizer, data_args: DataTrainingArgu
 def predict_dataset_for_model(raw_datasets, tokenizer, data_args: DataTrainingArguments,
                               training_args: Seq2SeqTrainingArguments):
     if "test" not in raw_datasets:
-        raise ValueError("--do_eval requires a test dataset")
+        raise ValueError("--do_predict requires a test dataset")
+
+    # 取出训练数据
 
     # 取出训练数据
     predict_dataset = raw_datasets["test"]
 
-    # 最大训练样本数量
-    if data_args.max_predict_samples is not None:
-        max_predict_samples = min(len(predict_dataset), data_args.max_predict_samples)
-        predict_dataset = predict_dataset.select(range(max_predict_samples))
+        # 最大训练样本数量
+    if data_args.max_eval_samples is not None:
+        max_test_samples = min(len(predict_dataset), data_args.max_predict_samples)
+        predict_dataset = predict_dataset.select(range(max_test_samples))
 
     """
     让主进程先执行某些操作，比如数据预处理，然后再由其他进程处理。
     比如在分布式训练中，可能每个进程都会加载数据集，但预处理步骤如果由所有进程各自执行的话，可能会有重复，浪费资源。所以让主进程先处理，然后将结果共享给其他进程，这样可以节省时间和内存
     """
-    with training_args.main_process_first(desc="validation dataset map pre-processing"):
+    with training_args.main_process_first(desc="prediction dataset map pre-processing"):
         predict_dataset = predict_dataset.map(
-            preprocess_function_train,
+            preprocess_function_eval,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
-            remove_columns=raw_datasets["train"].column_names,
+            remove_columns=raw_datasets["test"].column_names,
             load_from_cache_file=False,
             desc="Running tokenizer on train dataset",
             fn_kwargs={
@@ -352,6 +357,8 @@ def predict_dataset_for_model(raw_datasets, tokenizer, data_args: DataTrainingAr
                 "tokenizer": tokenizer
             }
         )
+    logging.info(f"predict_dataset is {predict_dataset[0]}")
+    logging.info(f"predict_dataset is {predict_dataset[1]}")
     return predict_dataset
 
 
@@ -420,7 +427,10 @@ def train(training_args, data_args, trainer, train_dataset, model):
 def eval(training_args, data_args, eval_dataset, trainer):
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate(metric_key_prefix="eval", do_sample=True, top_p=0.7, max_length=512,
+        metrics = trainer.evaluate(metric_key_prefix="eval",
+                                   do_sample=True,
+                                   top_p=0.7,
+                                   max_length=512,
                                    temperature=0.95)
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
@@ -452,7 +462,7 @@ def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
     predict_results = trainer.predict(
         predict_dataset,
         metric_key_prefix="predict",
-        max_new_tokens=data_args.max_target_length,
+        max_new_tokens=512,
         do_sample=False,
         num_beams=1,
         use_cache=True,
@@ -497,6 +507,7 @@ def predict(training_args, data_args, predict_dataset, tokenizer, trainer):
                         writer.write(f"{res}\n")
                     except TypeError as e:
                         raise ValueError(f"无法序列化第 {idx} 个样本: {str(e)}")
+
 
 def main():
     # HFArgumentParser 主要处理命令行的参数 ModelArguments为模型相关参数 DataTrainingArguments为数据训练相关参数
@@ -573,8 +584,8 @@ def main():
         tokenizer=tokenizer,
         model=model,
         label_pad_token_id=-100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id,
-        pad_to_multiple_of=None,
-        padding=False
+        pad_to_multiple_of=8,
+        padding=True
     )
     sample_batch = data_collator([eval_dataset[0]])
     logger.info(f"sample_batch keys is {sample_batch.keys()}")
@@ -593,17 +604,15 @@ def main():
     )
 
     # 模型训练
-    # trainer = train(training_args, data_args, trainer, train_dataset, model)
+    trainer = train(training_args, data_args, trainer, train_dataset, model)
 
-    trainer = create_mock_trainer()
+    # trainer = create_mock_trainer()
 
     # 模型评估
     eval(training_args, data_args, eval_dataset, trainer)
 
     # 模型预测
-    results = predict(training_args, data_args, predict_dataset, tokenizer, trainer)
-
-    logger.info(f"results is {results}")
+    predict(training_args, data_args, predict_dataset, tokenizer, trainer)
 
 if __name__ == "__main__":
     main()
